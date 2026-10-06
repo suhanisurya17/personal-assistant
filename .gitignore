@@ -1,0 +1,12 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+credentials.json
+client_secret_*.json
+token.json
+*.db
+logs/*
+!logs/.gitkeep
+.env.example
