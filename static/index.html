@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Today</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap">
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <header class="masthead">
+    <div>
+      <p class="eyebrow" id="greeting">Good morning</p>
+      <h1 id="today-date">Today</h1>
+    </div>
+    <nav class="toolbar" aria-label="Dashboard controls">
+      <button class="btn ghost" id="theme-toggle" type="button" aria-label="Switch light or dark">◐</button>
+      <button class="btn ghost" id="refresh-all" type="button">Refresh</button>
+      <button class="btn" id="edit-toggle" type="button" aria-pressed="false">Customize</button>
+    </nav>
+  </header>
+
+  <section class="edit-bar" id="edit-bar" hidden>
+    <p>Drag cards to rearrange. <b>S M L</b> resizes, <b>×</b> hides.</p>
+    <div class="tray" id="tray"></div>
+    <div class="edit-actions">
+      <button class="btn ghost" id="reset-layout" type="button">Reset</button>
+      <button class="btn" id="edit-done" type="button">Done</button>
+    </div>
+  </section>
+
+  <main class="grid" id="grid" aria-live="polite"></main>
+
+  <footer class="colophon">
+    <span>Runs locally · reads your Gmail &amp; Calendar directly</span>
+    <span id="last-sync"></span>
+  </footer>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

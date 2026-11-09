@@ -18,7 +18,7 @@ A small Python assistant for Gmail and Google Calendar, using the OpenAI Agents 
    uv run python app.py
    ```
 
-The first Google operation opens a browser for OAuth consent and stores the refresh token in `token.json`. Keep both credential files private.
+The first Google operation opens a browser for OAuth consent and stores the refresh token in `token.json`. If Google rejects an expired or revoked refresh token, the app opens a fresh consent flow and saves the replacement token. Keep both credential files private. OAuth apps left in Google's Testing status can have refresh tokens expire after seven days for these scopes, so development use may require periodic reauthorization.
 
 Set `GOOGLE_TIMEZONE` to an IANA timezone such as `America/New_York`. Calendar day summaries use that timezone for local midnight boundaries and account for daylight-saving changes.
 
@@ -33,7 +33,41 @@ The assistant creates drafts rather than sending mail. It should ask for explici
 
 To use the subscription tracker, ask "Show my subscriptions" to check scan status and existing records, or ask "Scan my inbox for subscriptions" to start a scan. It distinguishes an inbox that has not been scanned from a completed scan with no matching records. The tracker searches Gmail messages matching subscription, renewal, recurring, membership, trial, and billing terms; it does not inspect every inbox message or parse attached invoices. Verify uncertain results against their source email IDs. Currently records are grouped by merchant, so separate plans from the same sender may need manual review.
 
+For a provider-specific question such as "Canva?", the assistant first checks saved records. If none match, it can offer a targeted Gmail search for that provider; it should only perform that search after the user agrees. Tool errors report the Google error category/status rather than guessing at a token issue.
+
 The CLI keeps conversation history in memory while it is running, so short follow-ups such as "yes" retain their context. History is discarded when the CLI exits.
+
+## Dashboard
+
+A local web dashboard sits on top of the same Gmail and Calendar tools:
+
+```bash
+python server.py        # or: uv run python server.py
+```
+
+Then open http://127.0.0.1:8000. It only listens on your own machine.
+
+Cards:
+
+- **Daily summary:** a short brief that connects today's calendar with what's waiting in your inbox.
+- **Next up:** a countdown to your next event.
+- **Today:** your schedule, with free blocks of 30 minutes or more shown between events.
+- **Needs attention:** emails with deadlines, meeting requests, or replies owed. Each one is linked to that day's calendar, and anything due today or tomorrow is marked in red.
+- **News:** the top 3 stories from your latest TLDR email (TLDR by Wealthsimple or tldr.tech), read from Gmail.
+
+Click **Customize** to drag cards around, resize them (S/M/L), or hide and show them. The layout is saved in `assistant.db`.
+
+### How OpenAI usage stays low
+
+Every model result is saved in `assistant.db`, so refreshing the page or restarting the server doesn't call the model again.
+
+- The daily summary is written once per day. Only the **Rewrite** link asks for a new one.
+- Each email is classified once, by message ID. Later loads only send emails that arrived since then.
+- Each newsletter issue is summarized once. tldr.tech issues are parsed without the model at all.
+
+If the model is unavailable, the summary falls back to a plain count of events and emails, and the other cards say what couldn't be checked.
+
+Optional settings in `.env`: `NEWS_SENDERS` (a JSON list of Gmail `from:` values), plus `DAY_START_HOUR` and `DAY_END_HOUR` for the free-time window.
 
 ## Tests
 

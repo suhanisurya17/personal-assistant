@@ -1,14 +1,21 @@
 import base64
+import json
 from datetime import date, datetime, timezone
 from decimal import Decimal
 
 import pytest
+from google.auth.exceptions import RefreshError
 
 import agent
+import tools.google_auth as google_auth
 from models.schemas import EmailDraft, EventInput
 from tools.calendar import create_event, delete_event, summarize_day
 from tools.gmail import draft_email, read_email, summarize_inbox
-from tools.subscriptions import get_subscription_tracker, scan_subscription_inbox
+from tools.subscriptions import (
+    find_tracked_subscriptions,
+    get_subscription_tracker,
+    scan_subscription_inbox,
+)
 
 
 class Request:
@@ -42,8 +49,10 @@ class SubscriptionMessageReader:
     def __init__(self, messages, has_more=False):
         self.messages_by_id = {message["id"]: message for message in messages}
         self.has_more = has_more
+        self.list_kwargs = []
 
     def list(self, **kwargs):
+        self.list_kwargs.append(kwargs)
         response = {"messages": [{"id": key} for key in self.messages_by_id]}
         if self.has_more:
             response["nextPageToken"] = "next-page"
@@ -387,6 +396,80 @@ def test_subscription_scan_reports_when_result_limit_truncates_search(tmp_path):
     assert result.truncated is True
 
 
+def test_targeted_subscription_scan_searches_and_returns_only_named_provider(tmp_path):
+    service = SubscriptionGmailService([
+        _subscription_message(
+            "canva-sub",
+            "Your Canva subscription payment was received",
+            "Your annual subscription payment was successful: $120.00.",
+            "Canva Billing <billing@canva.example>",
+            "Mon, 5 Oct 2026 09:00:00 -0400",
+        ),
+        _subscription_message(
+            "other-sub",
+            "Your monthly subscription payment was received",
+            "Your monthly subscription payment was successful: $10.00.",
+            "OtherCo <billing@otherco.example>",
+            "Mon, 5 Oct 2026 09:00:00 -0400",
+        ),
+    ])
+
+    result = scan_subscription_inbox(
+        merchant="Canva",
+        service=service,
+        database_path=str(tmp_path / "assistant.db"),
+        today=date(2026, 10, 5),
+    )
+
+    assert service.message_reader.list_kwargs[0]["q"] == 'in:inbox "Canva"'
+    assert len(result.subscriptions) == 1
+    assert result.subscriptions[0].merchant == "Canva"
+
+
+def test_find_subscription_only_checks_saved_records(tmp_path):
+    database_path = str(tmp_path / "assistant.db")
+    service = SubscriptionGmailService([
+        _subscription_message(
+            "canva-sub",
+            "Your Canva subscription payment was received",
+            "Your annual subscription payment was successful: $120.00.",
+            "Canva Billing <billing@canva.example>",
+            "Mon, 5 Oct 2026 09:00:00 -0400",
+        )
+    ])
+    scan_subscription_inbox(
+        service=service,
+        database_path=database_path,
+        today=date(2026, 10, 5),
+    )
+
+    matches = find_tracked_subscriptions("canva", database_path)
+
+    assert len(matches) == 1
+    assert matches[0].merchant == "Canva Billing"
+
+
+def test_transaction_charge_does_not_prove_subscription_is_active(tmp_path):
+    service = SubscriptionGmailService([
+        _subscription_message(
+            "uber-receipt",
+            "Your Uber trip receipt",
+            "You were charged $18.50. Your Uber One subscription benefits are available.",
+            "Uber <receipts@uber.example>",
+            "Mon, 5 Oct 2026 09:00:00 -0400",
+        )
+    ])
+
+    result = scan_subscription_inbox(
+        service=service,
+        database_path=str(tmp_path / "assistant.db"),
+        today=date(2026, 10, 5),
+    )
+
+    assert result.subscriptions[0].status.value == "unknown"
+    assert result.subscriptions[0].last_payment_date is None
+
+
 def test_subscription_scan_estimates_next_due_date_from_payment(tmp_path):
     service = SubscriptionGmailService([
         _subscription_message(
@@ -502,6 +585,74 @@ def test_build_agent_requires_openai_key(monkeypatch):
 
     with pytest.raises(RuntimeError, match="OPENAI_API_KEY is missing"):
         agent.build_agent()
+
+
+def test_revoked_google_refresh_token_triggers_fresh_authorization(tmp_path, monkeypatch):
+    token_path = tmp_path / "token.json"
+    client_path = tmp_path / "client.json"
+    client_path.write_text("{}")
+
+    class Credentials:
+        expired = True
+        refresh_token = "old-refresh-token"
+        valid = False
+
+        def refresh(self, request):
+            raise RefreshError(
+                "invalid_grant",
+                {"error": "invalid_grant", "error_description": "Token expired or revoked"},
+            )
+
+    refreshed = type(
+        "Credentials",
+        (),
+        {"valid": True, "refresh_token": "new-refresh-token", "to_json": lambda self: '{"fresh": true}'},
+    )()
+    monkeypatch.setattr(
+        google_auth,
+        "get_settings",
+        lambda: type(
+            "Settings",
+            (),
+            {
+                "google_token_file": str(token_path),
+                "google_credentials_file": str(client_path),
+            },
+        )(),
+    )
+    monkeypatch.setattr(
+        google_auth.Credentials,
+        "from_authorized_user_file",
+        lambda *args, **kwargs: Credentials(),
+    )
+    authorization_paths = []
+    monkeypatch.setattr(
+        google_auth,
+        "_authorize",
+        lambda path: (authorization_paths.append(path), refreshed)[1],
+    )
+    token_path.write_text('{"stale": true}')
+
+    result = google_auth.get_google_credentials()
+
+    assert result is refreshed
+    assert authorization_paths == [client_path]
+    assert json.loads(token_path.read_text()) == {"fresh": True}
+
+
+def test_google_operation_returns_specific_reauthorization_error():
+    result = json.loads(
+        agent._run_google_operation(
+            lambda: (_ for _ in ()).throw(
+                google_auth.GoogleReauthorizationRequired(
+                    "Google rejected the saved token; sign in again."
+                )
+            )
+        )
+    )
+
+    assert result["error"] == "google_reauthorization_required"
+    assert result["message"] == "Google rejected the saved token; sign in again."
 
 
 @pytest.mark.asyncio

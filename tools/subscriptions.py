@@ -41,12 +41,19 @@ _INACTIVE_PATTERN = re.compile(
 _ACTIVE_PATTERN = re.compile(
     r"\b(payment (?:was )?(?:received|successful|processed)|payment confirmation|"
     r"subscription renewed|renewal (?:confirmed|successful)|subscription is active|"
-    r"next billing|next payment|will renew|has been renewed|charged)\b",
+    r"next billing|next payment|will renew|has been renewed)\b",
     re.IGNORECASE,
 )
 _PAYMENT_PATTERN = re.compile(
     r"\b(payment (?:was )?(?:received|successful|processed)|payment confirmation|"
-    r"subscription renewed|renewal (?:confirmed|successful)|has been renewed|charged)\b",
+    r"subscription renewed|renewal (?:confirmed|successful)|has been renewed)\b",
+    re.IGNORECASE,
+)
+_SUBSCRIPTION_PAYMENT_PATTERN = re.compile(
+    r"\b(?:subscription|membership|recurring|monthly|annual|yearly)\b.{0,80}"
+    r"\b(?:payment|charge|renewal|renewed|billed|billing)\b|"
+    r"\b(?:payment|charge|renewal|renewed|billed|billing)\b.{0,80}"
+    r"\b(?:subscription|membership|recurring|monthly|annual|yearly)\b",
     re.IGNORECASE,
 )
 _SUBSCRIPTION_PATTERN = re.compile(
@@ -68,6 +75,10 @@ _EXPLICIT_DUE_PATTERN = re.compile(
 
 def _service(service: Any | None) -> Any:
     return service if service is not None else build_google_service("gmail", "v1")
+
+
+def _normalize_merchant(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", value.casefold())
 
 
 def _merchant(message: EmailMessage) -> str:
@@ -173,6 +184,8 @@ def _extract_record(message: EmailMessage, today: date) -> SubscriptionRecord | 
     ] + [
         (match.start(), SubscriptionStatus.ACTIVE, match.group(0))
         for match in _ACTIVE_PATTERN.finditer(text)
+        if not re.match(r"payment", match.group(0), re.IGNORECASE)
+        or _SUBSCRIPTION_PAYMENT_PATTERN.search(text)
     ]
     latest_status = max(status_matches, default=None, key=lambda match: match[0])
     if latest_status and latest_status[1] == SubscriptionStatus.INACTIVE:
@@ -191,7 +204,13 @@ def _extract_record(message: EmailMessage, today: date) -> SubscriptionRecord | 
     message_date = received_at.date()
     cycle = _billing_cycle(text)
     amount, currency, ambiguous_amount = _amount(text)
-    is_payment = bool(_PAYMENT_PATTERN.search(text))
+    is_payment = bool(
+        _PAYMENT_PATTERN.search(text)
+        and (
+            _SUBSCRIPTION_PAYMENT_PATTERN.search(text)
+            or cycle != BillingCycle.UNKNOWN
+        )
+    )
     last_payment_date = message_date if is_payment else None
     explicit_due_date = _explicit_due_date(text, message_date)
     next_due_date, due_is_estimate = _next_due_date(
@@ -326,13 +345,20 @@ def scan_subscription_inbox(
     service: Any | None = None,
     database_path: str | None = None,
     today: date | None = None,
+    merchant: str | None = None,
 ) -> SubscriptionScanResult:
     if not 1 <= max_results <= 500:
         raise ValueError("max_results must be between 1 and 500")
+    if merchant is not None and not merchant.strip():
+        raise ValueError("merchant must not be blank")
 
     gmail = _service(service)
     settings = get_settings()
     local_today = today or datetime.now(ZoneInfo(settings.google_timezone)).date()
+    query = SUBSCRIPTION_QUERY
+    if merchant:
+        safe_merchant = merchant.strip().replace('"', '\\"')
+        query = f'in:inbox "{safe_merchant}"'
     store = SubscriptionStore(database_path or settings.database_path)
     scanned = 0
     matched = 0
@@ -347,7 +373,7 @@ def scan_subscription_inbox(
                 .messages()
                 .list(
                     userId="me",
-                    q=SUBSCRIPTION_QUERY,
+                    q=query,
                     maxResults=page_size,
                     pageToken=page_token,
                 )
@@ -364,6 +390,17 @@ def scan_subscription_inbox(
                 record = _extract_record(message, local_today)
                 if record is None:
                     continue
+                if merchant:
+                    merchant_key = _normalize_merchant(merchant)
+                    message_content = " ".join((message.sender, message.subject, message.body))
+                    if merchant_key not in _normalize_merchant(message_content):
+                        continue
+                    record = record.model_copy(
+                        update={
+                            "id": merchant_key,
+                            "merchant": merchant.strip(),
+                        }
+                    )
                 matched += 1
                 existing_batch = records_by_id.get(record.id)
                 if existing_batch is not None:
@@ -394,7 +431,9 @@ def scan_subscription_inbox(
             scanned_emails=scanned,
             matched_emails=matched,
             truncated=page_token is not None,
-            subscriptions=store.list_all(),
+            subscriptions=(
+                list(records_by_id.values()) if merchant else store.list_all()
+            ),
         )
     finally:
         store.close()
@@ -406,3 +445,17 @@ def get_subscription_tracker(database_path: str | None = None) -> SubscriptionTr
         return store.tracker_view()
     finally:
         store.close()
+
+
+def find_tracked_subscriptions(
+    merchant: str,
+    database_path: str | None = None,
+) -> list[SubscriptionRecord]:
+    if not merchant.strip():
+        raise ValueError("merchant must not be blank")
+    target = _normalize_merchant(merchant)
+    return [
+        record
+        for record in get_subscription_tracker(database_path).subscriptions
+        if target in _normalize_merchant(record.merchant)
+    ]
